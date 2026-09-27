@@ -5,7 +5,11 @@ import psycopg
 from jose import JWTError, jwt
 from litestar import Litestar, Request, get, post
 from litestar.exceptions import HTTPException
-from litestar.status_codes import HTTP_401_UNAUTHORIZED, HTTP_403_FORBIDDEN
+from litestar.status_codes import (
+    HTTP_401_UNAUTHORIZED,
+    HTTP_403_FORBIDDEN,
+    HTTP_409_CONFLICT,
+)
 from passlib.context import CryptContext
 from psycopg.rows import dict_row
 from pydantic import BaseModel
@@ -30,6 +34,14 @@ CREATE TABLE IF NOT EXISTS jobs (
     created_by text NOT NULL,
     created_at timestamptz NOT NULL
 );
+CREATE TABLE IF NOT EXISTS requeue_logs (
+    id serial PRIMARY KEY,
+    job_id integer NOT NULL REFERENCES jobs(id),
+    old_measured_nm double precision NOT NULL,
+    new_measured_nm double precision NOT NULL,
+    changed_by text NOT NULL,
+    changed_at timestamptz NOT NULL
+);
 """
 
 
@@ -45,6 +57,10 @@ class LoginIn(BaseModel):
 class JobIn(BaseModel):
     lamp: str
     nominal_nm: float
+    measured_nm: float
+
+
+class RequeueIn(BaseModel):
     measured_nm: float
 
 
@@ -123,6 +139,52 @@ async def create_job(request: Request, data: JobIn) -> dict:
         return {"id": row["id"], "status": "pending"}
 
 
+@post("/api/jobs/{job_id:int}/requeue")
+async def requeue_job(request: Request, job_id: int, data: RequeueIn) -> dict:
+    user = user_from_request(request)
+    if user["role"] != "writer":
+        raise HTTPException(status_code=HTTP_403_FORBIDDEN, detail="仅校准员可改实测重投")
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT id, measured_nm, status FROM jobs WHERE id = %s FOR UPDATE",
+            (job_id,),
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="任务不存在")
+        if row["status"] == "processing":
+            raise HTTPException(status_code=HTTP_409_CONFLICT, detail="任务领取中，实测不可再改")
+        if row["status"] != "pending":
+            raise HTTPException(status_code=HTTP_409_CONFLICT, detail="任务已结案，实测不可再改")
+        conn.execute(
+            "UPDATE jobs SET measured_nm = %s WHERE id = %s",
+            (data.measured_nm, job_id),
+        )
+        conn.execute(
+            """
+            INSERT INTO requeue_logs(job_id, old_measured_nm, new_measured_nm, changed_by, changed_at)
+            VALUES (%s,%s,%s,%s,%s)
+            """,
+            (job_id, row["measured_nm"], data.measured_nm, user["username"], datetime.now(timezone.utc)),
+        )
+        conn.commit()
+        return {"id": job_id, "status": "pending", "measured_nm": data.measured_nm}
+
+
+@get("/api/jobs/{job_id:int}/requeue-logs")
+async def list_requeue_logs(request: Request, job_id: int) -> list:
+    user_from_request(request)
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, job_id, old_measured_nm, new_measured_nm, changed_by,
+                   to_char(changed_at, 'YYYY-MM-DD HH24:MI:SS') AS changed_at
+            FROM requeue_logs WHERE job_id = %s ORDER BY id
+            """,
+            (job_id,),
+        ).fetchall()
+        return list(rows)
+
+
 def on_startup() -> None:
     with connect() as conn:
         conn.execute(SCHEMA)
@@ -141,4 +203,7 @@ def on_startup() -> None:
         conn.commit()
 
 
-app = Litestar(route_handlers=[health, login, list_jobs, get_job, create_job], on_startup=[on_startup])
+app = Litestar(
+    route_handlers=[health, login, list_jobs, get_job, create_job, requeue_job, list_requeue_logs],
+    on_startup=[on_startup],
+)

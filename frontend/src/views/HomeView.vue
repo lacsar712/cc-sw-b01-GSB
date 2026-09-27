@@ -10,6 +10,11 @@ const err = ref('')
 const form = ref({ lamp: '', nominal_nm: 0.15, measured_nm: 0.15 })
 let timer
 
+const STATUS_LABEL = { pending: '待处理', processing: '领取中', done: '已结案' }
+function statusLabel(s) {
+  return STATUS_LABEL[s] || s
+}
+
 async function refresh() {
   if (!localStorage.getItem('tok')) return
   try {
@@ -69,7 +74,7 @@ onUnmounted(() => clearInterval(timer))
           <td>{{ j.lamp }}</td>
           <td>{{ j.nominal_nm }}</td>
           <td>{{ j.measured_nm }}</td>
-          <td>{{ j.status }}</td>
+          <td>{{ statusLabel(j.status) }}</td>
           <td>{{ j.verdict }}</td>
           <td>{{ j.reason }}</td>
         </tr>

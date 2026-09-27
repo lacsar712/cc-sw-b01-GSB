@@ -2,6 +2,7 @@
 import { computed, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api } from './api.js'
+import RequeueDesk from './views/RequeueDesk.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -10,6 +11,7 @@ const role = ref(localStorage.getItem('role') || '')
 const user = ref(localStorage.getItem('user') || '')
 const err = ref('')
 const loginForm = ref({ username: 'calibrator', password: 'calib123456' })
+const showRequeueDesk = ref(false)
 
 const isHome = computed(() => route.path === '/')
 const isDetail = computed(() => route.path.startsWith('/jobs/'))
@@ -52,6 +54,13 @@ function logout() {
       <nav class="nav">
         <router-link to="/" :class="{ active: isHome }">校准总览</router-link>
         <span class="nav-sep">|</span>
+        <button
+          type="button"
+          class="nav-btn"
+          :class="{ active: showRequeueDesk }"
+          @click="showRequeueDesk = true"
+        >重投台</button>
+        <span class="nav-sep">|</span>
         <span
           class="nav-hint"
           :class="{ active: isDetail }"
@@ -78,6 +87,8 @@ function logout() {
       </template>
       <router-view v-else />
     </main>
+
+    <RequeueDesk v-if="showRequeueDesk" @close="showRequeueDesk = false" />
   </div>
 </template>
 
@@ -125,6 +136,24 @@ function logout() {
 }
 .nav a.active,
 .nav-hint.active {
+  color: #fff;
+  background: rgba(255, 255, 255, 0.15);
+  font-weight: 600;
+}
+.nav-btn {
+  color: #a8b8c8;
+  background: transparent;
+  border: none;
+  padding: 4px 8px;
+  border-radius: 4px;
+  font-size: 14px;
+  cursor: pointer;
+}
+.nav-btn:hover {
+  color: #fff;
+  background: rgba(255, 255, 255, 0.08);
+}
+.nav-btn.active {
   color: #fff;
   background: rgba(255, 255, 255, 0.15);
   font-weight: 600;
