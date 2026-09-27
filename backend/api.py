@@ -1,3 +1,4 @@
+import math
 import os
 from datetime import datetime, timedelta, timezone
 
@@ -5,7 +6,7 @@ import psycopg
 from jose import JWTError, jwt
 from litestar import Litestar, Request, get, post
 from litestar.exceptions import HTTPException
-from litestar.status_codes import HTTP_401_UNAUTHORIZED, HTTP_403_FORBIDDEN
+from litestar.status_codes import HTTP_401_UNAUTHORIZED, HTTP_403_FORBIDDEN, HTTP_409_CONFLICT
 from passlib.context import CryptContext
 from psycopg.rows import dict_row
 from pydantic import BaseModel
@@ -18,19 +19,35 @@ USERS = {
     "inspector": {"role": "reader", "password_hash": pwd.hash("insp123456")},
 }
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS jobs (
-    id serial PRIMARY KEY,
-    lamp text NOT NULL,
-    nominal_nm double precision NOT NULL,
-    measured_nm double precision NOT NULL,
-    status text NOT NULL,
-    verdict text NOT NULL DEFAULT '',
-    reason text NOT NULL DEFAULT '',
-    created_by text NOT NULL,
-    created_at timestamptz NOT NULL
-);
-"""
+MIGRATIONS = [
+    """
+    CREATE TABLE IF NOT EXISTS jobs (
+        id serial PRIMARY KEY,
+        lamp text NOT NULL,
+        nominal_nm double precision NOT NULL,
+        measured_nm double precision NOT NULL,
+        status text NOT NULL,
+        verdict text NOT NULL DEFAULT '',
+        reason text NOT NULL DEFAULT '',
+        created_by text NOT NULL,
+        created_at timestamptz NOT NULL,
+        updated_at timestamptz
+    )
+    """,
+    "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS updated_at timestamptz",
+    "UPDATE jobs SET updated_at = created_at WHERE updated_at IS NULL",
+    """
+    CREATE TABLE IF NOT EXISTS job_events (
+        id serial PRIMARY KEY,
+        job_id integer NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+        event text NOT NULL,
+        old_measured_nm double precision,
+        new_measured_nm double precision,
+        actor text NOT NULL,
+        created_at timestamptz NOT NULL
+    )
+    """,
+]
 
 
 def connect():
@@ -45,6 +62,10 @@ class LoginIn(BaseModel):
 class JobIn(BaseModel):
     lamp: str
     nominal_nm: float
+    measured_nm: float
+
+
+class ResubmitIn(BaseModel):
     measured_nm: float
 
 
@@ -111,34 +132,120 @@ async def create_job(request: Request, data: JobIn) -> dict:
     user = user_from_request(request)
     if user["role"] != "writer":
         raise HTTPException(status_code=HTTP_403_FORBIDDEN, detail="仅校准员可提交")
+    if not (math.isfinite(data.nominal_nm) and math.isfinite(data.measured_nm)):
+        raise HTTPException(status_code=400, detail="波长必须是有限数值")
     with connect() as conn:
+        now = datetime.now(timezone.utc)
         row = conn.execute(
             """
-            INSERT INTO jobs(lamp, nominal_nm, measured_nm, status, verdict, reason, created_by, created_at)
-            VALUES (%s,%s,%s,'pending','','',%s,%s) RETURNING id
+            INSERT INTO jobs(lamp, nominal_nm, measured_nm, status, verdict, reason, created_by, created_at, updated_at)
+            VALUES (%s,%s,%s,'pending','','',%s,%s,%s) RETURNING id
             """,
-            (data.lamp.strip(), data.nominal_nm, data.measured_nm, user["username"], datetime.now(timezone.utc)),
+            (data.lamp.strip(), data.nominal_nm, data.measured_nm, user["username"], now, now),
         ).fetchone()
         conn.commit()
         return {"id": row["id"], "status": "pending"}
 
 
+@post("/api/jobs/{job_id:int}/resubmit")
+async def resubmit_job(request: Request, job_id: int, data: ResubmitIn) -> dict:
+    user = user_from_request(request)
+    if user["role"] != "writer":
+        raise HTTPException(status_code=HTTP_403_FORBIDDEN, detail="仅校准员可改实测重投")
+    if not math.isfinite(data.measured_nm):
+        raise HTTPException(status_code=400, detail="实测波长必须是有限数值")
+    with connect() as conn:
+        job = conn.execute(
+            "SELECT id, status, measured_nm FROM jobs WHERE id = %s", (job_id,)
+        ).fetchone()
+        if not job:
+            raise HTTPException(status_code=404, detail="任务不存在")
+        if job["status"] == "claimed":
+            raise HTTPException(status_code=HTTP_409_CONFLICT, detail="任务领取中，不可改实测")
+        if job["status"] != "pending":
+            raise HTTPException(status_code=HTTP_409_CONFLICT, detail="任务已结案，不可改实测")
+        now = datetime.now(timezone.utc)
+        # 与领取进程竞争时以状态条件兜底：只有仍排队未领走的才允许改
+        updated = conn.execute(
+            "UPDATE jobs SET measured_nm=%s, updated_at=%s WHERE id=%s AND status='pending'",
+            (data.measured_nm, now, job_id),
+        ).rowcount
+        if updated == 0:
+            raise HTTPException(status_code=HTTP_409_CONFLICT, detail="任务已被领取，不可改实测")
+        conn.execute(
+            """
+            INSERT INTO job_events(job_id, event, old_measured_nm, new_measured_nm, actor, created_at)
+            VALUES (%s,'resubmit',%s,%s,%s,%s)
+            """,
+            (job_id, job["measured_nm"], data.measured_nm, user["username"], now),
+        )
+        conn.commit()
+        return {
+            "id": job_id,
+            "status": "pending",
+            "old_measured_nm": job["measured_nm"],
+            "new_measured_nm": data.measured_nm,
+        }
+
+
+@get("/api/jobs/{job_id:int}/events")
+async def list_job_events(request: Request, job_id: int) -> list:
+    user_from_request(request)
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, job_id, event, old_measured_nm, new_measured_nm, actor, created_at
+            FROM job_events WHERE job_id = %s ORDER BY id
+            """,
+            (job_id,),
+        ).fetchall()
+        return list(rows)
+
+
+@get("/api/events")
+async def list_events(request: Request) -> list:
+    user_from_request(request)
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT e.id, e.job_id, e.event, e.old_measured_nm, e.new_measured_nm, e.actor, e.created_at,
+                   j.lamp, j.nominal_nm
+            FROM job_events e JOIN jobs j ON j.id = e.job_id
+            ORDER BY e.id DESC
+            """
+        ).fetchall()
+        return list(rows)
+
+
 def on_startup() -> None:
     with connect() as conn:
-        conn.execute(SCHEMA)
+        for stmt in MIGRATIONS:
+            conn.execute(stmt)
         n = conn.execute("SELECT COUNT(*) AS n FROM jobs").fetchone()["n"]
         if n == 0:
             now = datetime.now(timezone.utc)
             conn.execute(
                 """
-                INSERT INTO jobs(lamp, nominal_nm, measured_nm, status, verdict, reason, created_by, created_at)
+                INSERT INTO jobs(lamp, nominal_nm, measured_nm, status, verdict, reason, created_by, created_at, updated_at)
                 VALUES
-                ('氦灯-587', 587.56, 587.50, 'done', '合格', '偏差 0.0600 nm 在允差内', 'seed', %s),
-                ('汞灯-546', 546.07, 546.30, 'done', '超差', '偏差 0.2300 nm 超过允差 0.08', 'seed', %s)
+                ('氦灯-587', 587.56, 587.50, 'done', '合格', '偏差 0.0600 nm 在允差内', 'seed', %s, %s),
+                ('汞灯-546', 546.07, 546.30, 'done', '超差', '偏差 0.2300 nm 超过允差 0.08', 'seed', %s, %s)
                 """,
-                (now, now),
+                (now, now, now, now),
             )
         conn.commit()
 
 
-app = Litestar(route_handlers=[health, login, list_jobs, get_job, create_job], on_startup=[on_startup])
+app = Litestar(
+    route_handlers=[
+        health,
+        login,
+        list_jobs,
+        get_job,
+        create_job,
+        resubmit_job,
+        list_job_events,
+        list_events,
+    ],
+    on_startup=[on_startup],
+)

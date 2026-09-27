@@ -8,6 +8,7 @@ const role = ref(localStorage.getItem('role') || '')
 const jobs = ref([])
 const err = ref('')
 const form = ref({ lamp: '', nominal_nm: 0.15, measured_nm: 0.15 })
+const STATUS_LABEL = { pending: '待处理', claimed: '领取中', done: '已结案' }
 let timer
 
 async function refresh() {
@@ -69,7 +70,7 @@ onUnmounted(() => clearInterval(timer))
           <td>{{ j.lamp }}</td>
           <td>{{ j.nominal_nm }}</td>
           <td>{{ j.measured_nm }}</td>
-          <td>{{ j.status }}</td>
+          <td>{{ STATUS_LABEL[j.status] || j.status }}</td>
           <td>{{ j.verdict }}</td>
           <td>{{ j.reason }}</td>
         </tr>
